@@ -389,6 +389,12 @@ interface Armed {
 const LEASE_MS = 60_000;
 
 /**
+ * How many staged rows a queue drain takes under one lease. A backlog is read a
+ * page at a time, not loaded whole, and each page takes the lease afresh.
+ */
+const DRAIN_PAGE = 256;
+
+/**
  * Take a drain's lease: `undefined` once taken, or when the lease another
  * drain holds ends. That drain may have died with an earlier instance and
  * left work behind, so a drain that can't take the lease looks again then.
@@ -439,13 +445,13 @@ const queue = <Row>(
         return;
       }
       yield* Effect.gen(function* () {
-        const rows = yield* state.storage.list<Row>({ prefix });
+        const rows = yield* state.storage.list<Row>({ prefix, limit: DRAIN_PAGE });
         for (const [key, row] of rows) {
           yield* process(row);
           yield* state.storage.delete(key);
         }
       }).pipe(Effect.ensuring(state.storage.delete(lease).pipe(Effect.ignore)));
-      // Rows staged while this drain ran.
+      // Rows past this page, or staged while it ran.
       const more = yield* state.storage.list({ prefix, limit: 1 });
       if (more.size > 0) yield* drain;
     }) as Effect.Effect<void>;
