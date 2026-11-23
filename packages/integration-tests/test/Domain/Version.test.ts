@@ -194,6 +194,73 @@ const history = [
   send(new Deposit({ id: "a-2", amount: 3 })),
 ];
 
+class Noted extends Domain.Event("Noted", { amount: Schema.Number }) {}
+class Note extends Domain.Command("Note", {
+  input: { id: Schema.String, amount: Schema.Number },
+  events: [Noted],
+}) {}
+/** What the policy did: one entry per command it sent. */
+class Notes extends Domain.Aggregate("Notes", {
+  id: Schema.String,
+  state: Schema.Struct({ amounts: Schema.Array(Schema.Number) }),
+  initial: { amounts: [] },
+  commands: [Note],
+  keyOf: (command) => command.id,
+  decide: { Note: (_, cmd) => [new Noted({ amount: cmd.amount })] },
+  evolve: { Noted: (s, e) => ({ amounts: [...s.amounts, e.amount] }) },
+}) {}
+
+/** Version 0: emits every deposit and withdrawal. */
+class Moves extends Domain.View("Moves", {
+  from: [Account],
+  key: Account,
+  state: Net,
+  initial: { net: 0 },
+  evolve: {
+    Deposited: (s, e) => ({ net: s.net + e.amount }),
+    Withdrawn: (s, e) => ({ net: s.net - e.amount }),
+  },
+}) {}
+/** Version 1: emits deposits only, so a rebuilt key holds fewer rows than before. */
+class MovesV1 extends Domain.View("Moves", {
+  from: [Account],
+  key: Account,
+  state: Net,
+  initial: { net: 0 },
+  evolve: { Deposited: (s, e) => ({ net: s.net + e.amount }) },
+  version: 1,
+}) {}
+
+class Record extends Domain.Policy("Record", { from: Moves, on: [Deposited, Withdrawn] }) {}
+class RecordV1 extends Domain.Policy("Record", { from: MovesV1, on: [Deposited] }) {}
+const RecordLive = Record.toLayer(
+  Effect.gen(function* () {
+    const notes = yield* Notes;
+    return Effect.fn(function* ({ source, event }) {
+      yield* notes.send(new Note({ id: source.id, amount: event.amount })).pipe(Effect.orDie);
+    });
+  }),
+);
+const RecordV1Live = RecordV1.toLayer(
+  Effect.gen(function* () {
+    const notes = yield* Notes;
+    return Effect.fn(function* ({ source, event }) {
+      yield* notes.send(new Note({ id: source.id, amount: event.amount })).pipe(Effect.orDie);
+    });
+  }),
+);
+
+class Recorded extends Domain.Model("Recorded", {
+  aggregates: [Account, Notes],
+  views: [Moves],
+  policies: [Record],
+}) {}
+class RecordedV1 extends Domain.Model("Recorded", {
+  aggregates: [Account, Notes],
+  views: [MovesV1],
+  policies: [RecordV1],
+}) {}
+
 describe("Domain view versions", { tags: ["unit", "local"] }, () => {
   it.live(
     "a view keyed by its aggregate is rebuilt in place: each key reads its events again",
@@ -320,6 +387,39 @@ describe("Domain projection versions", { tags: ["unit", "local"] }, () => {
       );
       // The replay appends nothing again, and nothing after the bump is lost.
       expect(after).toEqual([10, -4, 3, 5, 7]);
+    }),
+  );
+});
+
+describe("Domain policy on a rebuilt view", { tags: ["unit", "local"] }, () => {
+  it.live("a policy acts on what a rebuilt view emits after the bump", () =>
+    Effect.gen(function* () {
+      const bank = platform();
+      const before = yield* bank.deploy(
+        Recorded,
+        Effect.gen(function* () {
+          yield* send(new Deposit({ id: "a-1", amount: 10 }));
+          yield* send(new Withdraw({ id: "a-1", amount: 4 }));
+          yield* bank.settle;
+          return yield* (yield* Notes).get("a-1");
+        }),
+        RecordLive,
+      );
+      expect(before).toEqual({ amounts: [10, 4] });
+      const after = yield* bank.deploy(
+        RecordedV1,
+        Effect.gen(function* () {
+          // Read first, the key is rebuilt in place: it emits the one deposit again, as history.
+          expect(yield* (yield* MovesV1).get(Account.ref("a-1"))).toEqual(Option.some({ net: 10 }));
+          yield* bank.settle;
+          // The rebuilt key emits this deposit as its seq 2, the seq the withdrawal had.
+          yield* send(new Deposit({ id: "a-1", amount: 5 }));
+          yield* bank.settle;
+          return yield* (yield* Notes).get("a-1");
+        }),
+        RecordV1Live,
+      );
+      expect(after).toEqual({ amounts: [10, 4, 5] });
     }),
   );
 });

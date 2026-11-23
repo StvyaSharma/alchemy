@@ -89,6 +89,12 @@ export interface Delivery {
   readonly source: string;
   /** The event's sequence number in its source stream. */
   readonly seq: number;
+  /**
+   * For an event from a rebuilt view: the view's generation. A rebuilt view
+   * numbers its events from 1 again, so `seq` alone repeats an earlier
+   * generation's (see {@link sourceId}).
+   */
+  readonly sourceGeneration?: number;
   /** The aggregate or view that produced the event. */
   readonly origin: string;
   readonly tag: string;
@@ -113,6 +119,16 @@ export interface Delivery {
    */
   readonly revision?: Revision;
 }
+
+/**
+ * The event a delivery carries, as a policy tells it from every other:
+ * `Account/a-1:3`, or `Outflow/a-1#2:3` from a view's second rebuild. A
+ * policy keys its duplicates check and its command ids on it.
+ */
+export const sourceId = (delivery: Delivery): string =>
+  delivery.sourceGeneration
+    ? `${delivery.source}#${delivery.sourceGeneration}:${delivery.seq}`
+    : `${delivery.source}:${delivery.seq}`;
 
 /**
  * What a rewrite of a source tells a view or projection key about one event
