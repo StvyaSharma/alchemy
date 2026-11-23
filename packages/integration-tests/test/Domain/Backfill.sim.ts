@@ -841,6 +841,7 @@ export class Sim {
                 if ((next[target] ?? 0) === before) {
                   next = { ...next, [target]: before + 1 };
                   send.push(...deliveries);
+                  for (const d of deliveries) this.routedLive.add(`${d.key}|${d.source}#${d.seq}`);
                 } else {
                   // Behind here: withheld, for its reader to read from the log.
                   yield* source.role.onCommit(target);
@@ -869,6 +870,9 @@ export class Sim {
       ),
     );
   }
+
+  /** Deliveries a commit routed live: `key|source#seq`. */
+  readonly routedLive = new Set<string>();
 
   /** Instances do not list themselves after their first commit: a test calls {@link Sim.list}. */
   holdListing = false;

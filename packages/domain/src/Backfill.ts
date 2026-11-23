@@ -118,8 +118,9 @@ export interface Listing {
 export interface SourceRpc {
   /**
    * `cursor`, `log` and, at the end of the log, `handoff`, in one call: what a
-   * reader of a short history needs. Older code doesn't have it: a reader falls
-   * back to the three calls.
+   * reader needs. The rows stop where the source routes the target live (see
+   * {@link Read.live}): a reader never reads a row that reached its keys live.
+   * With `limit` 0, it says only where to start and where to stop.
    */
   readonly read: (
     ref: SourceRef,
@@ -166,6 +167,12 @@ export interface Read {
   readonly rows: ReadonlyArray<unknown>;
   /** Fewer rows than asked for: the end of the log, and whether it switched the target to live there. */
   readonly handoff?: Handoff;
+  /**
+   * The source routes the target live after this seq: the rows after it
+   * reached their keys live, so `rows` stop there, and a reader reads no
+   * further. Absent while the target is behind (or on older code).
+   */
+  readonly live?: number;
 }
 
 /** A page a key read from its source. */
@@ -537,15 +544,12 @@ type Retry = ReturnType<typeof makeRetry>;
 /** A call that counts as lost if it hasn't answered in time: a hung call would stall its caller. */
 const bounded = <A, E>(call: Effect.Effect<A, E>) => call.pipe(Effect.timeout("20 seconds"));
 
-/** Where `ref`'s live routing to `target` stopped; 0 (read it all) if it can't say (older code). */
-const cursorOf = (net: Network, ref: SourceRef, target: string) =>
-  bounded(net.source.cursor(ref, target)).pipe(Effect.catchCause(() => Effect.succeed(0)));
-
 /**
  * Read a page of `ref`'s log for `target` in one call (see `SourceRpc.read`).
- * A source on older code has no `read`: fall back to `cursor` and `log`, and
- * the caller asks for the handoff itself. A call the account's load refused
- * fails, for the caller to back off.
+ * A call that fails, refused for the account's load or lost in transit, fails
+ * for the caller to try again. It is not read another way: a lost `read` may
+ * have switched the target to live, and only `read` stops at the rows that
+ * reached their keys live since.
  */
 const readAt = (
   net: Network,
@@ -554,18 +558,7 @@ const readAt = (
   key: string,
   after: number,
   limit: number,
-): Effect.Effect<Read, unknown> =>
-  bounded(net.source.read(ref, target, key, after, limit)).pipe(
-    Effect.catchCauseIf(
-      (cause) => !overloaded(cause),
-      () =>
-        Effect.gen(function* () {
-          const from = after > 0 ? after : yield* cursorOf(net, ref, target);
-          const rows = yield* bounded(net.source.log(ref, from, limit));
-          return { from, rows } satisfies Read;
-        }),
-    ),
-  );
+): Effect.Effect<Read, unknown> => bounded(net.source.read(ref, target, key, after, limit));
 
 /** A target's generation: `view:Name#2` is 2. */
 const generationOf = (target: string) => Number(/[#@](\d+)$/.exec(target)?.[1] ?? 0);
@@ -678,28 +671,57 @@ export const makeSource = (
    * Where live routing to `target` stopped (see `SourceRpc.cursor`), as it was
    * when its reader first asked: kept, so a reader that asks again (its answer
    * lost after the source went live) starts at the same row, not past it.
+   * Callers hold the exclusive section.
    */
-  const cursor = (target: string) =>
-    storage.exclusive(
-      Effect.gen(function* () {
-        const kept = yield* storage.get<number>(fromKey(target));
-        if (kept !== undefined) return kept;
-        const routed = yield* host.routed;
-        const from = routed === undefined ? yield* host.version : (routed[target] ?? 0);
-        yield* storage.put({ [fromKey(target)]: from });
-        return from;
-      }),
-    );
+  const cursorOf = (target: string) =>
+    Effect.gen(function* () {
+      const kept = yield* storage.get<number>(fromKey(target));
+      if (kept !== undefined) return kept;
+      const routed = yield* host.routed;
+      const from = routed === undefined ? yield* host.version : (routed[target] ?? 0);
+      yield* storage.put({ [fromKey(target)]: from });
+      return from;
+    });
+  const cursor = (target: string) => storage.exclusive(cursorOf(target));
+
+  const liveKey = (target: string) => `bf:live:${enc(target)}`;
+
+  /**
+   * The seq after which `target` is routed live, if it is: every row after it
+   * reached its keys live, so no reader reads it as history. Recorded when the
+   * target goes live, or, for one live before any reader asked (an instance
+   * created on code that knows it), the first time it is asked. Callers hold
+   * the exclusive section.
+   */
+  const liveAfter = (target: string) =>
+    Effect.gen(function* () {
+      if (!host.model().includes(target)) return undefined;
+      const routed = yield* host.routed;
+      const version = yield* host.version;
+      // Behind here: its commits are withheld, and its reader reads them.
+      if (routed !== undefined && (routed[target] ?? 0) !== version) return undefined;
+      const kept = yield* storage.get<number>(liveKey(target));
+      if (kept !== undefined) return kept;
+      yield* storage.put({ [liveKey(target)]: version });
+      return version;
+    });
 
   const handoff = (target: string, key: string, through: number) =>
     Effect.gen(function* () {
       if (!host.model().includes(target)) return "stale" as Handoff;
       const result = yield* storage.exclusive(
         Effect.gen(function* () {
+          // Live already, from a row the reader has: what follows reached its keys live.
+          const live = yield* liveAfter(target);
+          if (live !== undefined && through >= live) {
+            yield* storage.delete([kickedKey(target)]);
+            return "live" as const;
+          }
           // Rows were added after the reader read up to `through`: it reads them first.
           if ((yield* host.version) > through) return "more" as const;
           const routed = yield* host.routed;
           if (routed !== undefined && (routed[target] ?? 0) < through) yield* host.markLive(target);
+          yield* storage.put({ [liveKey(target)]: through });
           yield* storage.delete([kickedKey(target)]);
           return "live" as const;
         }),
@@ -748,16 +770,27 @@ export const makeSource = (
 
     cursor: (target: string) => cursor(target),
 
-    read: (target: string, key: string, after: number, limit: number) =>
+    read: (target: string, key: string, after: number, limit: number): Effect.Effect<Read> =>
       Effect.gen(function* () {
-        const from = after > 0 ? after : yield* cursor(target);
-        const rows = yield* host.log(from, limit);
-        if (rows.length >= limit) return { from, rows } satisfies Read;
-        // Rows are numbered without gaps: these end at `from + rows.length`.
+        // Where to start, and where live routing took over, together and before reading:
+        // a commit that lands meanwhile is live.
+        const { from, live } = yield* storage.exclusive(
+          Effect.gen(function* () {
+            const from = after > 0 ? after : yield* cursorOf(target);
+            return { from, live: yield* liveAfter(target) };
+          }),
+        );
+        // Rows are numbered without gaps: row `from + i + 1` is `rows[i]`. Those after
+        // `live` reached their keys live, and are not read again.
+        const capped = live === undefined ? limit : Math.min(limit, Math.max(0, live - from));
+        const rows = capped === 0 ? [] : yield* host.log(from, capped);
+        const at = live === undefined ? {} : { live };
+        if (rows.length >= limit) return { from, rows, ...at } satisfies Read;
         return {
           from,
           rows,
           handoff: yield* handoff(target, key, from + rows.length),
+          ...at,
         } satisfies Read;
       }),
 
@@ -791,6 +824,13 @@ interface ScanState {
   readonly started?: boolean;
   /** Every row up to this seq is with its keys. */
   readonly through: number;
+  /** The source routed the target live after this seq when it started: it reads no further. */
+  readonly until?: number;
+  /**
+   * Read to the end of the log at `through`: it asks (or asked) the source to
+   * route the target live from there, and asks again before it reads on.
+   */
+  readonly ended?: boolean;
   /** Read to the end of the log at least once: the history a run waits for is with its keys. */
   readonly scanned: boolean;
   /** The source routes the target live: nothing more to read. */
@@ -824,15 +864,26 @@ export const makeScanner = (
   const jobId = (target: string) => `bf-scan:${target}`;
   const getState = (target: string) => storage.get<ScanState>(stateKey(target));
 
-  /** Start where the source's live routing stopped: the keys have every row before it. */
+  /**
+   * Start where the source's live routing stopped: the keys have every row
+   * before it. A source that routes the target live already says from where
+   * (an empty `read`), and the scanner stops there: what follows reached the
+   * keys live.
+   */
   const start = (target: string, state: ScanState) =>
     Effect.gen(function* () {
-      const cursor = yield* cursorOf(net, state.ref, target);
+      // Lost, it is asked again: a step that fails is run again later.
+      const read = yield* readAt(net, state.ref, target, "", 0, 0).pipe(Effect.orDie);
       return yield* storage.exclusive(
         Effect.gen(function* () {
           const current = (yield* getState(target)) ?? state;
           if (current.started) return current;
-          const started = { ...current, started: true, through: Math.max(current.through, cursor) };
+          const started: ScanState = {
+            ...current,
+            started: true,
+            through: Math.max(current.through, read.from),
+            ...(read.live === undefined ? {} : { until: read.live }),
+          };
           yield* storage.put({ [stateKey(target)]: started });
           return started;
         }),
@@ -886,9 +937,24 @@ export const makeScanner = (
       const found = yield* getState(target);
       if (found === undefined || found.live) return { pushed: true, next: "never" } as const;
       const state = found.started ? found : yield* start(target, found);
-      const rows = yield* bounded(net.source.log(state.ref, state.through, limits.page)).pipe(
-        Effect.orDie,
-      );
+      // No further than where the source routed the target live, if it did when this started.
+      const limit =
+        state.until === undefined
+          ? limits.page
+          : Math.min(limits.page, Math.max(0, state.until - state.through));
+      // A handoff that answered `stale`, not at all, or before a crash may have switched
+      // the target to live: ask again before reading on, as the rows past it reached the
+      // keys live. Lost too, this step fails, and runs again.
+      if (limit > 0 && (state.ended || state.scanned)) {
+        const again = yield* bounded(net.source.handoff(state.ref, target, "", state.through)).pipe(
+          Effect.orDie,
+        );
+        if (again === "live") return yield* settle(target, state, again);
+      }
+      const rows =
+        limit === 0
+          ? []
+          : yield* bounded(net.source.log(state.ref, state.through, limit)).pipe(Effect.orDie);
       if (rows.length > 0) {
         const routed = yield* host.route(target, state.ref, rows);
         const through = routed.length > 0 ? routed[routed.length - 1]!.seq : state.through;
@@ -925,16 +991,35 @@ export const makeScanner = (
           Effect.gen(function* () {
             const latest = yield* getState(target);
             if (latest !== undefined && latest.through === state.through)
-              yield* storage.put({ [stateKey(target)]: { ...latest, through } });
+              yield* storage.put({
+                [stateKey(target)]: { ...latest, through, ended: rows.length < limits.page },
+              });
           }),
         );
         if (rows.length >= limits.page) return { pushed: state.scanned, next: "now" } as const;
-      }
+      } else if (limit > 0 && !state.ended)
+        yield* storage.exclusive(
+          Effect.gen(function* () {
+            const latest = yield* getState(target);
+            if (latest !== undefined && latest.through === state.through && !latest.ended)
+              yield* storage.put({ [stateKey(target)]: { ...latest, ended: true } });
+          }),
+        );
       // The end of the log: ask the source to deliver live from here.
       const after = (yield* getState(target))!;
       const handoff = yield* bounded(net.source.handoff(after.ref, target, "", after.through)).pipe(
         Effect.catchCause(() => Effect.succeed("stale" as Handoff)),
       );
+      return yield* settle(target, after, handoff);
+    });
+
+  /** Record what the source answered at the end of its log, and when to step again. */
+  const settle = (
+    target: string,
+    after: ScanState,
+    handoff: Handoff,
+  ): Effect.Effect<{ readonly pushed: boolean; readonly next: "now" | "later" | "never" }> =>
+    Effect.gen(function* () {
       if (handoff === "more") return { pushed: after.scanned, next: "now" } as const;
       yield* storage.exclusive(
         Effect.gen(function* () {

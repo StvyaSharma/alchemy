@@ -32,6 +32,14 @@ const verify = (sim: Sim) =>
       const ids = applied.map(({ delivery }) => `${delivery.source}#${delivery.seq}`);
       // Exactly once each.
       expect([...ids].sort()).toEqual([...events].sort());
+      // An event a commit routed live arrives live: never read again as history
+      // (which a view's downstream policies would skip).
+      expect(
+        applied
+          .filter(({ delivery }) => delivery.history)
+          .map(({ delivery }) => `${delivery.key}|${delivery.source}#${delivery.seq}`)
+          .filter((id) => sim.routedLive.has(id)),
+      ).toEqual([]);
       // In seq order per source.
       const last = new Map<string, number>();
       for (const { delivery } of applied) {
@@ -56,9 +64,14 @@ const verify = (sim: Sim) =>
         ).toBe(source.events.length);
       }
       expect(
-        // A source keeps where its reader started (`bf:from:`), for a reader that asks again.
+        // A source keeps where its reader started (`bf:from:`) and where live routing took
+        // over (`bf:live:`), for a reader that asks again.
         [...source.object.data.keys()].filter(
-          (key) => key.startsWith("bf:") && !key.startsWith("bf:q-") && !key.startsWith("bf:from:"),
+          (key) =>
+            key.startsWith("bf:") &&
+            !key.startsWith("bf:q-") &&
+            !key.startsWith("bf:from:") &&
+            !key.startsWith("bf:live:"),
         ),
       ).toEqual([]);
     }
@@ -336,6 +349,45 @@ describe("Domain backfill (simulated)", { tags: ["unit", "local"] }, () => {
       yield* sim.run([...history(sim, 6, 20, 6, "s"), ...history(sim, 3, 9, 4, "new")]);
     }),
   );
+
+  for (const singleSource of [false, true])
+    scenario(
+      `an instance live already when its reader starts: a commit before the reader reads arrives live${singleSource ? " (keyed by its source)" : ""}`,
+      (sim) =>
+        Effect.gen(function* () {
+          sim.singleSource = singleSource;
+          const key = (id: string) => (singleSource ? id : "k0");
+          for (let i = 0; i < 6; i++) {
+            sim.now += 1;
+            yield* sim.commit(`A/s${i % 2}`, [key(`s${i % 2}`)]);
+          }
+          yield* sim.deploy();
+          // Created on the deployed code: its commits reach the target live from the first.
+          sim.now += 1;
+          yield* sim.commit("A/n", [key("n")]);
+          // The reader asks the instance where to start, then a commit lands, then it reads.
+          let landed = false;
+          const land = Effect.suspend(() => {
+            if (landed) return Effect.void;
+            landed = true;
+            sim.now += 1;
+            return Effect.asVoid(sim.commit("A/n", [key("n")]));
+          });
+          const { read, cursor } = sim.net.source;
+          const net = sim.net.source as { -readonly [K in keyof typeof sim.net.source]: unknown };
+          net.read = ((ref, target, reader, after, limit) =>
+            read(ref, target, reader, after, limit).pipe(
+              Effect.tap(() => (ref.id === "n" ? land : Effect.void)),
+            )) satisfies typeof read;
+          net.cursor = ((ref, target) =>
+            cursor(ref, target).pipe(
+              Effect.tap(() => (ref.id === "n" ? land : Effect.void)),
+            )) satisfies typeof cursor;
+          yield* sim.run();
+          expect(landed).toBe(true);
+          expect(sim.routedLive.has(`${key("n")}|A/n#2`)).toBe(true);
+        }),
+    );
 
   scenario("instances still on older code catch up once they run the deployed code", (sim) =>
     Effect.gen(function* () {
