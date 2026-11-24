@@ -81,6 +81,7 @@ import {
   type SeedResult,
   type SendResult,
   sendResultOf,
+  sourceId,
   stampRevisions,
   type StoredEvent,
   storedDecisionReceipt,
@@ -2608,7 +2609,7 @@ const policyObject = (kit: PolicyKit) =>
           Effect.gen(function* () {
             // A rewrite's revision is the past changed: what a policy did has happened.
             if (delivery.revision !== undefined) return;
-            const id = `${delivery.source}:${delivery.seq}`;
+            const id = sourceId(delivery);
             const accepted = yield* exclusively(
               state.storage.transaction(
                 Effect.gen(function* () {

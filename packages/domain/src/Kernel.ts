@@ -74,6 +74,7 @@ import {
   type ViewInput,
   type ViewSnapshot,
   sameJson,
+  sourceId,
   viewInputOf,
 } from "./Platform.ts";
 import type * as Policy from "./Policy.ts";
@@ -2007,6 +2008,11 @@ const build = (
     const emit = handlers(def.emit);
     const encodeState = (state: unknown) =>
       codec && state !== null && state !== undefined ? codec.encode(state) : null;
+    /** The generation its deliveries carry, once rebuilt: its `seq`s start over at 1. */
+    const sourceGeneration = () => {
+      const generation = generationOf("view", view.viewName);
+      return generation > 0 ? { sourceGeneration: generation } : {};
+    };
     const kit: Omit<ViewKit, "push" | "refold" | "revise" | "recall"> = {
       name: view.viewName,
       deliver,
@@ -2048,6 +2054,7 @@ const build = (
                 {
                   source: stream,
                   seq: row.seq,
+                  ...sourceGeneration(),
                   origin: view.viewName,
                   tag: (row.event as { readonly _tag: string })._tag,
                   event: row.event,
@@ -2203,6 +2210,7 @@ const build = (
                   {
                     source: stream,
                     seq,
+                    ...sourceGeneration(),
                     origin: view.viewName,
                     tag: out._tag,
                     event: entry.event,
@@ -2391,6 +2399,7 @@ const build = (
               {
                 source: stream,
                 seq: row.seq,
+                ...sourceGeneration(),
                 origin: view.viewName,
                 tag: (row.event as { readonly _tag: string })._tag,
                 event: row.event,
@@ -2430,7 +2439,7 @@ const build = (
             delivery.routes ?? [undefined],
             (route) => {
               let n = 0;
-              const prefix = `${delivery.source}:${delivery.seq}:${policy.policyName}${route === undefined ? "" : `:${route}`}`;
+              const prefix = `${sourceId(delivery)}:${policy.policyName}${route === undefined ? "" : `:${route}`}`;
               return handler({ key, route, source, event, envelope, state }).pipe(
                 Effect.provideContext(
                   Context.make(Aggregate.PolicyRun, { next: () => `${prefix}:${n++}` }).pipe(
