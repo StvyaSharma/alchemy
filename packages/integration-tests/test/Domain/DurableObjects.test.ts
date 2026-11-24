@@ -12,6 +12,7 @@ import * as Exit from "effect/Exit";
 import * as Fiber from "effect/Fiber";
 import * as Layer from "effect/Layer";
 import * as Option from "effect/Option";
+import * as Schedule from "effect/Schedule";
 import * as Schema from "effect/Schema";
 import * as Scope from "effect/Scope";
 import * as Semaphore from "effect/Semaphore";
@@ -232,6 +233,101 @@ const importsOn = (platform: Layer.Layer<Domain.Platform, never, SecureRandom.Se
     Layer.provideMerge(platform),
     Layer.provideMerge(SecureRandom.layerWebCrypto),
   );
+
+// ---------------------------------------------------------------- a policy on a rebuilt view
+
+class Deposited extends Domain.Event("Deposited", { amount: Schema.Number }) {}
+class Withdrawn extends Domain.Event("Withdrawn", { amount: Schema.Number }) {}
+class Deposit extends Domain.Command("Deposit", {
+  input: { id: Schema.String, amount: Schema.Number },
+  events: [Deposited],
+}) {}
+class Withdraw extends Domain.Command("Withdraw", {
+  input: { id: Schema.String, amount: Schema.Number },
+  events: [Withdrawn],
+}) {}
+class Account extends Domain.Aggregate("Account", {
+  id: Schema.String,
+  state: Schema.Struct({ balance: Schema.Number }),
+  initial: { balance: 0 },
+  commands: [Deposit, Withdraw],
+  keyOf: (command) => command.id,
+  decide: {
+    Deposit: (_, { amount }) => [new Deposited({ amount })],
+    Withdraw: (_, { amount }) => [new Withdrawn({ amount })],
+  },
+  evolve: {
+    Deposited: (s, e) => ({ balance: s.balance + e.amount }),
+    Withdrawn: (s, e) => ({ balance: s.balance - e.amount }),
+  },
+}) {}
+
+const Net = Schema.Struct({ net: Schema.Number });
+/** Version 0: emits every deposit and withdrawal. */
+class Moves extends Domain.View("Moves", {
+  from: [Account],
+  key: Account,
+  state: Net,
+  initial: { net: 0 },
+  evolve: {
+    Deposited: (s, e) => ({ net: s.net + e.amount }),
+    Withdrawn: (s, e) => ({ net: s.net - e.amount }),
+  },
+}) {}
+/** Version 1: emits deposits only, so a rebuilt key numbers fewer entries than before. */
+class MovesV1 extends Domain.View("Moves", {
+  from: [Account],
+  key: Account,
+  state: Net,
+  initial: { net: 0 },
+  evolve: { Deposited: (s, e) => ({ net: s.net + e.amount }) },
+  version: 1,
+}) {}
+
+/** Notes every move it hears in the account's audit. */
+const noteMoves = Effect.gen(function* () {
+  const audits = yield* Audit;
+  return Effect.fn(function* ({
+    source,
+    event,
+  }: {
+    source: { id: string };
+    event: Deposited | Withdrawn;
+  }) {
+    yield* audits.send(new Note({ id: source.id, n: event.amount }));
+  });
+});
+class AuditMoves extends Domain.Policy("AuditMoves", {
+  from: Moves,
+  on: [Deposited, Withdrawn],
+}) {}
+class AuditMovesV1 extends Domain.Policy("AuditMoves", { from: MovesV1, on: [Deposited] }) {}
+const AuditMovesLive = AuditMoves.toLayer(noteMoves);
+const AuditMovesV1Live = AuditMovesV1.toLayer(noteMoves);
+
+class Audited extends Domain.Model("Audited", {
+  aggregates: [Account, Audit],
+  views: [Moves],
+  policies: [AuditMoves],
+}) {}
+class AuditedV1 extends Domain.Model("Audited", {
+  aggregates: [Account, Audit],
+  views: [MovesV1],
+  policies: [AuditMovesV1],
+}) {}
+
+/** What the audit of `id` has seen, once it has seen `count` moves. */
+const auditOf = (id: string, count: number) =>
+  Effect.gen(function* () {
+    const audits = yield* Audit;
+    return yield* audits.get(id).pipe(
+      Effect.repeat({
+        schedule: Schedule.spaced("20 millis"),
+        until: (audit) => audit.seen.length >= count,
+        times: 250,
+      }),
+    );
+  });
 
 describe("Domain on Durable Objects", { tags: ["unit"] }, () => {
   for (const [name, platform] of [
@@ -581,5 +677,48 @@ describe("Domain on Durable Objects", { tags: ["unit"] }, () => {
       }).pipe(Effect.scoped, Effect.provide(gated));
     },
     { timeout: 30_000 },
+  );
+
+  it.live(
+    "a policy acts on what a rebuilt view emits after the bump, at a seq an earlier generation used",
+    () => {
+      const stats: Stats = { rowsRead: 0 };
+      const disk: Disk = { objects: new Map() };
+      const first = simHost(stats, { disk });
+      const second = simHost(stats, { disk });
+      const onHost = (layer: Layer.Layer<any, any, any>, host: typeof first) =>
+        layer.pipe(
+          Layer.provideMerge(DurableObjects.makePlatform(host.host)),
+          Layer.provideMerge(SecureRandom.layerWebCrypto),
+        );
+      return Effect.gen(function* () {
+        const before = yield* Effect.gen(function* () {
+          const accounts = yield* Account;
+          yield* accounts.send(new Deposit({ id: "a-1", amount: 10 }));
+          yield* accounts.send(new Withdraw({ id: "a-1", amount: 4 }));
+          return yield* auditOf("a-1", 2);
+        }).pipe(Effect.scoped, Effect.provide(onHost(Audited.layer(AuditMovesLive), first)));
+        expect(before).toEqual({ seen: [10, 4] });
+        const after = yield* Effect.gen(function* () {
+          yield* second.wake;
+          // Read first, the key is rebuilt in place: it emits the one deposit again, as history.
+          const moves = yield* MovesV1;
+          const rebuilt = yield* moves.get(Account.ref("a-1")).pipe(
+            Effect.repeat({
+              schedule: Schedule.spaced("20 millis"),
+              until: (row) => Option.isSome(row) && row.value.net === 10,
+              times: 250,
+            }),
+          );
+          expect(rebuilt).toEqual(Option.some({ net: 10 }));
+          // The rebuilt key emits this deposit as its seq 2, the seq the withdrawal had.
+          const accounts = yield* Account;
+          yield* accounts.send(new Deposit({ id: "a-1", amount: 5 }));
+          return yield* auditOf("a-1", 3);
+        }).pipe(Effect.scoped, Effect.provide(onHost(AuditedV1.layer(AuditMovesV1Live), second)));
+        expect(after).toEqual({ seen: [10, 4, 5] });
+      });
+    },
+    { timeout: 60_000 },
   );
 });
