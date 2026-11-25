@@ -31,7 +31,8 @@ export const targetId = (target: {
  * Route a commit's deliveries: drop those to lagging consumers (they receive
  * the events by replay), and advance the cursors of the live ones from
  * `before` to `after`. An instance with no cursors yet predates catch-up; its
- * consumers are taken as caught up.
+ * consumers are taken as caught up. Policies get new events only: history (an
+ * import, or a rebuilt view's entries) is dropped rather than sent to be ignored.
  */
 export const routeLive = (
   targets: ReadonlyArray<string>,
@@ -45,8 +46,8 @@ export const routeLive = (
   const next: Record<string, number> = { ...base };
   for (const target of targets) if (live(target)) next[target] = after;
   return {
-    deliveries: deliveries.filter(
-      (delivery) => delivery.target.kind === "policy" || live(targetId(delivery.target)),
+    deliveries: deliveries.filter((delivery) =>
+      delivery.target.kind === "policy" ? !delivery.history : live(targetId(delivery.target)),
     ),
     routed: next,
   };

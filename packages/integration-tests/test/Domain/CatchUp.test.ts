@@ -1,5 +1,7 @@
 import * as Domain from "@alchemy.run/domain";
+import { routeLive } from "@alchemy.run/domain/CatchUp";
 import * as InMemory from "@alchemy.run/domain/InMemory";
+import type { Delivery } from "@alchemy.run/domain/Platform";
 import { describe, expect, it } from "@alchemy.run/test";
 import * as Context from "effect/Context";
 import * as Effect from "effect/Effect";
@@ -493,4 +495,32 @@ describe("Domain catch-up", { tags: ["unit", "local"] }, () => {
       expect(feed).toEqual(["deposit 1", "deposit 2", "deposit 1", "deposit 2"]);
     }).pipe(Effect.provide(platform().services)),
   );
+
+  it("routes history to views and projections, never to policies", () => {
+    const delivery = (kind: Delivery["target"]["kind"], history?: boolean): Delivery => ({
+      target: { kind, name: kind === "view" ? "Deposits" : "OnDeposit" },
+      key: "a-1",
+      source: "Account/a-1",
+      seq: 1,
+      origin: "Account",
+      tag: "Deposited",
+      event: null,
+      envelope: {
+        id: "a-1",
+        stream: "Account/a-1",
+        seq: 1,
+        at: 0,
+        commandId: "c",
+        correlationId: "c",
+      },
+      ...(history ? { history } : {}),
+    });
+    const route = (deliveries: ReadonlyArray<Delivery>) =>
+      routeLive(["view:Deposits"], undefined, 0, 1, deliveries).deliveries.map(
+        (d) => `${d.target.kind}${d.history ? " history" : ""}`,
+      );
+    // A new event reaches the policy; history (a rebuild's or an import's) does not.
+    expect(route([delivery("view"), delivery("policy")])).toEqual(["view", "policy"]);
+    expect(route([delivery("view", true), delivery("policy", true)])).toEqual(["view history"]);
+  });
 });
